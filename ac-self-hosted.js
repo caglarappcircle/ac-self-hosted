@@ -2155,6 +2155,12 @@ function createExport() {
     printWarning('The log settings for the docker engine may not be fully configured. For a standard installation, the value {"log-driver":"journald"} can be entered in the /etc/docker/daemon.json file');
   }
 
+  // Ensure all exported files are readable by container users (e.g. uid 10001).
+  // fs.copyFile preserves source permissions, so files from a umask 027 unzip
+  // could end up as 640 regardless of our process.umask() setting above.
+  // a+rX: add read for all, execute only where already set (directories).
+  execSync(`chmod -R a+rX "${exportPath}"`, { stdio: 'inherit' });
+
   console.log('Finish export operations');
 }
 
