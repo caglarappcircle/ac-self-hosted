@@ -12,6 +12,25 @@ const { compareVersions } = require('./version');
 const parentPath = __dirname;
 process.chdir(parentPath);
 
+// ─── Umask Fix ───────────────────────────────────────────────────────────────
+// Systems with umask 027 create files as 640, blocking container users (e.g. uid 10001).
+// Set 022 globally for this process so all created files are at least 644.
+const originalUmask = process.umask(0o022);
+if (originalUmask === 0o027) {
+  const bashrc = path.join(os.homedir(), '.bashrc');
+  const umaskLine = 'umask 022';
+  try {
+    const content = fs.existsSync(bashrc) ? fs.readFileSync(bashrc, 'utf8') : '';
+    if (!content.includes(umaskLine)) {
+      fs.appendFileSync(bashrc, `\n# Added by appcircle script to ensure correct file permissions\n${umaskLine}\n`);
+      console.log(`Note: Your system umask was 027 which causes permission issues. Added '${umaskLine}' to ${bashrc} for future sessions.`);
+    }
+  } catch {
+    // non-fatal, just warn
+    console.log(`Warning: System umask is 027. Consider adding '${umaskLine}' to your ~/.bashrc to avoid permission issues.`);
+  }
+}
+
 // ─── State Variables ─────────────────────────────────────────────────────────
 let updateSecretFlag = false;
 let installPackageFlag = false;
@@ -1361,46 +1380,7 @@ async function up() {
     execInherit(`${composeCli} -f ${exportPath}/compose.yaml up -d`);
   }
 
-  retryKeycloakMigration();
   runPostUpJobs();
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function retryKeycloakMigration() {
-  const containerCli = getContainerCli();
-  const migrationContainerName = `${projectName}-keycloak_migration-1`;
-  const maxRetries = 3;
-  const waitMs = 15000; // 15 seconds between retries
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    await sleep(waitMs);
-
-    let exitCode;
-    try {
-      exitCode = exec(`${containerCli} inspect --format='{{.State.ExitCode}}' "${migrationContainerName}"`);
-    } catch {
-      // container not found or not started yet
-      console.log(`keycloak_migration container not found, skipping retry.`);
-      return;
-    }
-
-    if (exitCode === '0') {
-      console.log('keycloak_migration completed successfully.');
-      return;
-    }
-
-    console.log(`keycloak_migration exited with code ${exitCode}. Retrying (${attempt}/${maxRetries})...`);
-    try {
-      execInherit(`${containerCli} start "${migrationContainerName}"`);
-    } catch {
-      console.log(`Failed to restart keycloak_migration container.`);
-    }
-  }
-
-  console.log(`keycloak_migration failed after ${maxRetries} retries. Please check logs: docker logs ${migrationContainerName}`);
 }
 
 function runPostUpJobs() {
@@ -1427,12 +1407,15 @@ function startPromtailService() {
     }
   } else {
     setupPromtailService(userSystemdServicePath, userLogServiceFullPath);
-    // Try without sudo first, fall back to sudo if access denied (e.g. RedHat 9.7)
-    try {
-      execInherit('loginctl enable-linger');
-    } catch {
-      const currentUser = process.env.USER || process.env.LOGNAME || require('os').userInfo().username;
-      execInherit(`sudo loginctl enable-linger "${currentUser}"`);
+    const currentUser = process.env.USER || process.env.LOGNAME || require('os').userInfo().username;
+    const lingerFile = `/var/lib/systemd/linger/${currentUser}`;
+    if (!fs.existsSync(lingerFile)) {
+      // Try without sudo first, fall back to sudo if access denied (e.g. RedHat 9.7)
+      try {
+        execInherit('loginctl enable-linger');
+      } catch {
+        execInherit(`sudo loginctl enable-linger "${currentUser}"`);
+      }
     }
   }
   execInherit(`systemctl ${getSystemdUserFlag()} enable --now "${logServiceName}"`);
@@ -2062,10 +2045,6 @@ function setResourceLimits() {
 }
 
 function createExport() {
-  // Set umask to 022 so exported files are readable by all users (e.g. container users like uid 10001)
-  // Without this, systems with umask 027 would create files with 640 permissions, blocking container access
-  const previousUmask = process.umask(0o022);
-
   // Check if the global yaml is valid.
   try {
     execSync(`yq "${globalFilePath}"`, { stdio: 'pipe' });
@@ -2177,9 +2156,6 @@ function createExport() {
   }
 
   console.log('Finish export operations');
-
-  // Restore previous umask
-  process.umask(previousUmask);
 }
 
 // ─── Main Entry Point ────────────────────────────────────────────────────────
